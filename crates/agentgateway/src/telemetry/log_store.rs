@@ -5,9 +5,10 @@ use std::time::Instant;
 use std::{env, thread};
 
 use chrono::{DateTime, Duration, Utc};
-use crossbeam::channel::{Receiver, Sender, TryRecvError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
@@ -35,7 +36,7 @@ pub struct Config {
 
 #[derive(Clone)]
 pub struct RequestLogStore {
-	tx: Sender<LogStoreMsg>,
+	tx: UnboundedSender<LogStoreMsg>,
 }
 
 impl RequestLogStore {
@@ -69,7 +70,7 @@ pub async fn setup_with_pool(
 	cfg: &Config,
 	pool: Option<crate::database::DatabasePool>,
 ) -> anyhow::Result<RequestLogStoreGuard> {
-	let (tx, rx) = crossbeam::channel::unbounded();
+	let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 	let (ready_tx, ready_rx) = oneshot::channel();
 	let writer = LogStoreWorker::new(rx, cfg.clone(), pool, ready_tx)
 		.worker_thread("request-log-db-writer".to_string())?;
@@ -129,7 +130,7 @@ pub async fn tail(request: TailRequest) -> anyhow::Result<TailResponse> {
 }
 
 pub struct RequestLogStoreGuard {
-	tx: Sender<LogStoreMsg>,
+	tx: UnboundedSender<LogStoreMsg>,
 	writer: Option<thread::JoinHandle<()>>,
 }
 
@@ -185,7 +186,7 @@ enum LogStoreMsg {
 type QueryResponse<T> = oneshot::Sender<anyhow::Result<T>>;
 
 struct LogStoreWorker {
-	receiver: Receiver<LogStoreMsg>,
+	receiver: UnboundedReceiver<LogStoreMsg>,
 	cfg: Config,
 	pool: Option<crate::database::DatabasePool>,
 	ready_tx: Option<oneshot::Sender<anyhow::Result<()>>>,
@@ -193,7 +194,7 @@ struct LogStoreWorker {
 
 impl LogStoreWorker {
 	fn new(
-		receiver: Receiver<LogStoreMsg>,
+		receiver: UnboundedReceiver<LogStoreMsg>,
 		cfg: Config,
 		pool: Option<crate::database::DatabasePool>,
 		ready_tx: oneshot::Sender<anyhow::Result<()>>,
@@ -253,14 +254,14 @@ impl LogStoreWorker {
 		self.notify_ready(Ok(()));
 		let mut batch = Vec::with_capacity(batch_size);
 		loop {
-			match self.receiver.recv() {
-				Ok(msg) => {
+			match self.receiver.recv().await {
+				Some(msg) => {
 					if process_log_store_msg(&backend, &mut batch, msg).await {
 						self.drain_available_messages(&backend, &mut batch).await;
 						break;
 					}
 				},
-				Err(_) => {
+				None => {
 					self.drain_available_messages(&backend, &mut batch).await;
 					break;
 				},
@@ -290,7 +291,11 @@ impl LogStoreWorker {
 		}
 	}
 
-	async fn drain_available_messages(&self, backend: &Backend, batch: &mut Vec<StoredRequestLog>) {
+	async fn drain_available_messages(
+		&mut self,
+		backend: &Backend,
+		batch: &mut Vec<StoredRequestLog>,
+	) {
 		loop {
 			match self.receiver.try_recv() {
 				Ok(msg) => {
@@ -964,5 +969,84 @@ impl Backend {
 			Self::Sqlite(store) => store.tail(request).await,
 			Self::Postgres(store) => store.tail(request).await,
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::time::Duration;
+
+	use super::*;
+
+	#[tokio::test]
+	#[ignore = "needs a Postgres URL in AGENTGATEWAY_TEST_POSTGRES_URL"]
+	async fn idle_writer_keeps_the_shared_postgres_pool_usable() {
+		let url = env::var("AGENTGATEWAY_TEST_POSTGRES_URL").expect("AGENTGATEWAY_TEST_POSTGRES_URL");
+		let pool = sqlx::postgres::PgPoolOptions::new()
+			.max_connections(1)
+			.connect_lazy(&url)
+			.unwrap();
+		let cfg = Config {
+			url,
+			max_connections: Some(1),
+		};
+		let guard = setup_with_pool(
+			&cfg,
+			Some(crate::database::DatabasePool::Postgres(pool.clone())),
+		)
+		.await
+		.unwrap();
+		let id = uuid::Uuid::new_v4().to_string();
+		let now = Utc::now();
+		REQUEST_LOG_STORE.get().unwrap().emit(PendingRequestLog {
+			record: StoredRequestLog {
+				id: id.clone(),
+				started_at: now,
+				completed_at: now,
+				duration_ms: 0,
+				trace_id: None,
+				span_id: None,
+				http_status: Some(200),
+				error: None,
+				gen_ai_operation_name: None,
+				gen_ai_provider_name: None,
+				gen_ai_request_model: None,
+				gen_ai_response_model: None,
+				input_tokens: None,
+				output_tokens: None,
+				total_tokens: None,
+				cache_read_input_tokens: None,
+				cache_creation_input_tokens: None,
+				reasoning_tokens: None,
+				time_to_first_token_ms: None,
+				time_per_output_token_ms: None,
+				cost: None,
+				agentgateway_user: None,
+				agentgateway_group: None,
+				user_agent_name: None,
+				has_payload: false,
+				attributes_json: "{}".into(),
+				payload: None,
+			},
+			llm_mode: None,
+			input_messages: None,
+			llm_response: None,
+		});
+		tokio::time::sleep(Duration::from_secs(1)).await;
+
+		let stored = tokio::time::timeout(
+			Duration::from_secs(5),
+			sqlx::query_scalar::<_, i64>("SELECT count(*) FROM request_logs WHERE id = $1")
+				.bind(&id)
+				.fetch_one(&pool),
+		)
+		.await;
+		guard.shutdown_and_wait().await;
+		assert_eq!(
+			stored
+				.expect("the shared pool stalled while the request log writer was idle")
+				.unwrap(),
+			1
+		);
 	}
 }
